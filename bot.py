@@ -320,7 +320,8 @@ def find_user(tok):
         return get("SELECT * FROM users WHERE username=? ORDER BY last_seen DESC", (tok[1:].lower(),))
     if tok.lstrip("-").isdigit():
         return get("SELECT * FROM users WHERE user_id=?", (int(tok),))
-    if tok:  # псевдоним администратора
+    if tok:  # псевдоним администратора (может состоять из нескольких слов)
+        tok = " ".join(tok.split())
         for a in all_("SELECT user_id, pseudo FROM admins WHERE pseudo IS NOT NULL"):
             if a["pseudo"].casefold() == tok.casefold():
                 return get("SELECT * FROM users WHERE user_id=?", (a["user_id"],))
@@ -361,7 +362,32 @@ async def alog(actor, target, action, details=""):
     if LOG_CHAT_ID:
         await dm(LOG_CHAT_ID,
                  f"📝 <b>{esc(action)}</b>\n👤 {who(actor)}" + (f" → {who(target)}" if target else "")
-                 + (f"\n{esc(details)}" if details else ""))
+                 + (f"\n{esc(details[:500])}" if details else ""))
+
+
+def chunks(text, limit=3800):
+    """Режет длинный текст по строкам, чтобы не превысить лимит Telegram (4096) и не сломать HTML-теги."""
+    out, cur = [], ""
+    for line in str(text).split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + len(line) + 1 > limit:
+            out.append(cur)
+            cur = ""
+        cur = (cur + "\n" + line) if cur else line
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+async def reply_long(m: Message, text, **kw):
+    parts = chunks(text)
+    for i, part in enumerate(parts):
+        await m.answer(part, **(kw if i == len(parts) - 1 else {}))
 
 
 def chat_kind(m: Message):
@@ -412,6 +438,21 @@ async def target_or_fail(m, tok, need_admin=False, destructive=False):
         await m.answer("🛡 Вписанных в код нельзя снять с администрации.")
         return None
     return t
+
+
+def level_error(actor, target_uid, new_level=None):
+    """Иерархия: нельзя выдать уровень выше своего и нельзя менять админа своего или более высокого уровня.
+    Вписанные в код ограничений не имеют."""
+    if is_dev(actor):
+        return None
+    me = get_admin(actor)
+    mylvl = me["level"] if me else 0
+    if new_level is not None and new_level > mylvl:
+        return f"🚫 Нельзя выдать уровень выше своего (ваш уровень: {mylvl})."
+    tgt = get_admin(target_uid)
+    if tgt and (target_uid == actor or tgt["level"] >= mylvl):
+        return "🚫 Нельзя менять администратора своего или более высокого уровня."
+    return None
 
 
 def parse_delta(tok):
@@ -692,7 +733,7 @@ async def cmd_dj(m: Message):
             cur = a["level"]
             t += f"\n<b>━ Уровень {cur} ━</b>\n"
         t += f"• {tag(a['user_id'])} — {esc(a['position'])}\n"
-    await m.answer(t)
+    await reply_long(m, t)
 
 
 @r.message(Command("week"))
@@ -757,7 +798,7 @@ async def cmd_onduty(m: Message):
         t += f"• {tag(a['user_id'])} — {esc(a['position'])} · выключен {ago(ts)} назад{' ⚠️' if long_ else ''}\n"
     if not off:
         t += "— нет —\n"
-    await m.answer(t)
+    await reply_long(m, t)
 
 
 @r.message(Command("queue"))
@@ -850,6 +891,10 @@ async def cmd_makeadmin(m: Message, command: CommandObject):
     if dept is None:
         await m.answer("Отдел: tech / edu / main / none")
         return
+    err = level_error(m.from_user.id, uid, lvl)
+    if err:
+        await m.answer(err)
+        return
     if lvl == 0:
         if is_dev(uid):
             await m.answer("🛡 Вписанных в код нельзя снять с администрации.")
@@ -885,6 +930,10 @@ async def cmd_uplvl(m: Message, command: CommandObject):
     if a["level"] >= 7:
         await m.answer("Максимальный уровень уже достигнут.")
         return
+    err = level_error(m.from_user.id, t["user_id"], a["level"] + 1)
+    if err:
+        await m.answer(err)
+        return
     run("UPDATE admins SET level=level+1 WHERE user_id=?", (t["user_id"],))
     await alog(m.from_user.id, t["user_id"], "Повышение уровня", f"{a['level']} → {a['level'] + 1}")
     await m.answer(f"⬆️ {tag(t['user_id'])}: {a['level']} → {a['level'] + 1} ур.")
@@ -899,6 +948,10 @@ async def cmd_kick(m: Message, command: CommandObject):
     if not t:
         return
     uid = t["user_id"]
+    err = level_error(m.from_user.id, uid)
+    if err:
+        await m.answer(err)
+        return
     d = get_admin(uid)
     if d and d["current_dialog"]:
         dd = get("SELECT * FROM dialogs WHERE id=?", (d["current_dialog"],))
@@ -985,7 +1038,7 @@ async def punish(m, command, kind):
             auto += 1
     run("UPDATE admins SET warns=?, vigs=? WHERE user_id=?", (warns, vigs, uid))
     run("INSERT INTO punishments(user_id,kind,delta,reason,by_id,ts) VALUES(?,?,?,?,?,?)",
-        (uid, kind, delta, p[2], m.from_user.id, now()))
+        (uid, kind, delta, p[2][:300], m.from_user.id, now()))
     name = "Выговор" if kind == "vig" else "Предупреждение"
     await alog(m.from_user.id, uid, f"{name} {delta:+d}", p[2])
     extra = "\n⚠️ 3 предупреждения → выдан 1 выговор." * (1 if auto else 0)
@@ -1164,7 +1217,7 @@ async def cmd_find(m: Message, command: CommandObject):
     text += "\n".join(f"• {fdt(x['ts'])} {x['kind']} {x['delta']:+d} — {esc(x['reason'])} ({tag(x['by_id'])})"
                       for x in pn) or "— нет —"
     await alog(m.from_user.id, uid, "Запрос досье (/find)")
-    await m.answer(text)
+    await reply_long(m, text)
 
 
 @r.message(Command("getday"))
@@ -1184,7 +1237,7 @@ async def cmd_getday(m: Message, command: CommandObject):
                 (t["user_id"], since))
     head = f"🧾 Ответы {tag(t['user_id'])} за {'неделю' if week else 'день'}: <b>{len(rows)}</b> (до 100)\n\n"
     body = "\n".join(f"<code>#{x['id']}</code> · {fdt(x['ts'])} · {x['ctype']}" for x in rows) or "— нет ответов —"
-    await m.answer(head + body + "\n\nПосмотреть: <code>/checkot id</code>")
+    await reply_long(m, head + body + "\n\nПосмотреть: <code>/checkot id</code>")
 
 
 @r.message(Command("checkot"))
@@ -1215,7 +1268,7 @@ async def cmd_checkot(m: Message, command: CommandObject):
     if fb:
         t += f"\n⭐ Оценка диалога: {fb['stars']}/5\n💬 Отзыв: {esc(fb['text'] or '—')}"
     await alog(m.from_user.id, x["sender"], "Проверка ответа (/checkot)", f"#{x['id']}")
-    await m.answer(t[:4000])
+    await reply_long(m, t)
 
 
 @r.message(Command("logs"))
@@ -1385,6 +1438,8 @@ async def cmd_setlogs(m: Message, command: CommandObject):
 @r.message(Command("help"))
 async def cmd_help(m: Message):
     if m.chat.type != "private":
+        if chat_kind(m):
+            await m.answer("ℹ️ /help работает только в личных сообщениях с ботом.")
         return
     uid = m.from_user.id
     lines = [f"<code>{c} {a}</code>\n   ↳ {d}\n   📍 {WHERE_TXT[w]}"
@@ -1392,7 +1447,7 @@ async def cmd_help(m: Message):
     if not lines:
         await m.answer("Для обращения к администратору нажмите /start.")
         return
-    await m.answer("📖 <b>Доступные вам команды</b>\n\n" + "\n\n".join(lines))
+    await reply_long(m, "📖 <b>Доступные вам команды</b>\n\n" + "\n\n".join(lines))
 
 
 # ───────────────────────── РАСШИРЕНИЯ ─────────────────────────
@@ -1529,7 +1584,7 @@ async def cmd_warns(m: Message, command: CommandObject):
                  f"   Причина: {esc(x['reason'])}\n   Кто выдал: {tag(x['by_id'])}\n\n")
     if not rows:
         text += "— записей нет —"
-    await m.answer(text[:4000])
+    await reply_long(m, text)
 
 
 # ── /transfer
@@ -1551,7 +1606,8 @@ async def cmd_transfer(m: Message, command: CommandObject):
         await m.answer("🚫 Передавать можно только свой диалог.")
         return
     old = d["admin_id"]
-    if p[1].lower() in ("tech", "tex", "тех"):
+    dest = " ".join(p[1:])
+    if dest.lower() in ("tech", "tex", "тех"):
         run("UPDATE dialogs SET dept='tech', admin_id=NULL, status='waiting', remind_ref=0 WHERE id=?", (did,))
         run("UPDATE admins SET current_dialog=0 WHERE user_id=?", (old,))
         n = await notify_admins(get("SELECT * FROM dialogs WHERE id=?", (did,)), exclude={old})
@@ -1559,7 +1615,7 @@ async def cmd_transfer(m: Message, command: CommandObject):
         await alog(uid, old, "Передача диалога в тех. поддержку", f"диалог #{did}")
         await m.answer(f"✅ Диалог #{did} передан в очередь тех. поддержки (уведомлено: {n}).")
         return
-    t = await target_or_fail(m, p[1], need_admin=True)
+    t = await target_or_fail(m, dest, need_admin=True)
     if not t:
         return
     ta = get_admin(t["user_id"])
@@ -1604,7 +1660,7 @@ async def cmd_temes(m: Message):
         return
     text = "📑 <b>Актуальные шаблоны</b>\n\n" + "\n\n".join(
         f"<b>{x['id']}. {esc(x['title'])}</b>\n{esc(x['text'])}" for x in rows)
-    await m.answer(text[:4000])
+    await reply_long(m, text)
 
 
 @r.message(Command("addtem"))
@@ -1800,10 +1856,12 @@ async def cmd_changepsevd(m: Message, command: CommandObject):
     if not await guard(m, "admin", "any"):
         return
     uid = m.from_user.id
-    new = (command.args or "").strip()
-    if not re.fullmatch(r"[\w\-]{2,24}", new) or new.isdigit():
+    new = " ".join((command.args or "").split())
+    if (not 2 <= len(new) <= 32 or not re.fullmatch(r"[\w\-]+(?: [\w\-]+)*", new)
+            or new.replace(" ", "").isdigit()):
         await m.answer("Использование: <code>/changepsevd псевдоним</code>\n"
-                       "Одно слово, 2–24 символа: буквы, цифры, «_» и «-». Например: <code>Котик</code>.\n"
+                       "Можно из нескольких слов, 2–32 символа: буквы, цифры, «_» и «-». "
+                       "Например: <code>Белый Котик</code>.\n"
                        f"Сейчас у вас: <b>{esc(pseudo_of(uid))}</b>")
         return
     for x in all_("SELECT user_id, pseudo FROM admins WHERE pseudo IS NOT NULL"):
@@ -1992,7 +2050,8 @@ async def send_summary():
               + "\n".join(low[:40]) + "\n\nВыдать предупреждение: <code>/pred +1 @юз причина</code>")
     else:
         t += "\n✅ Все администраторы были активны."
-    await dm(chat, t[:4000])
+    for part in chunks(t):
+        await dm(chat, part)
 
 
 async def send_backup(to=None):
